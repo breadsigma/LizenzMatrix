@@ -34,6 +34,11 @@
     Anmeldung per Geraetecode (Code auf https://microsoft.com/devicelogin eingeben).
     Hilft, wenn das Anmeldefenster nicht erscheint, z. B. in der PowerShell ISE oder auf einem Server.
 
+.PARAMETER GraphVersion
+    Version der Microsoft.Graph-Module, die geladen werden soll (z. B. 2.29.1).
+    Ohne Angabe wird die hoechste Version genommen, die fuer alle benoetigten Module installiert ist.
+    Verschiedene Versionen gemischt fuehren zu Fehlern wie "Could not load file or assembly".
+
 .PARAMETER IncludeTeamsPhone
     Prueft zusaetzlich mit dem MicrosoftTeams-Modul, wer Teams-Telefonie (Enterprise Voice) nutzt.
 
@@ -64,7 +69,8 @@ param(
     [ValidateSet('D7', 'D30', 'D90', 'D180')]
     [string]$Period = 'D90',
     [switch]$IncludeTeamsPhone,
-    [switch]$UseDeviceCode
+    [switch]$UseDeviceCode,
+    [string]$GraphVersion
 )
 
 $ErrorActionPreference = 'Stop'
@@ -162,6 +168,29 @@ function Export-Report($Data, [string]$Name) {
 # --------------------------------------------------------------------------------------------
 # 1. Verbinden
 # --------------------------------------------------------------------------------------------
+Write-Step 'Lade Microsoft.Graph-Module'
+# Alle Graph-Module muessen exakt dieselbe Version haben, sonst gibt es Assembly-Konflikte.
+$graphModules = 'Microsoft.Graph.Authentication', 'Microsoft.Graph.Users', 'Microsoft.Graph.Identity.DirectoryManagement'
+if (-not $GraphVersion) {
+    $common = @()
+    $first = $true
+    foreach ($m in $graphModules) {
+        $versions = @(Get-Module -ListAvailable -Name $m | ForEach-Object { $_.Version.ToString() })
+        if (-not $versions) { throw "Modul $m ist nicht installiert. Install-Module $m -Scope CurrentUser" }
+        if ($first) { $common = $versions; $first = $false }
+        else { $common = @($common | Where-Object { $versions -contains $_ }) }
+    }
+    if (-not $common) {
+        throw ('Die Graph-Module sind in unterschiedlichen Versionen installiert. Bitte alle in derselben Version installieren, z. B.: ' +
+            "Install-Module $($graphModules -join ', ') -RequiredVersion 2.29.1 -Scope CurrentUser -Force -AllowClobber")
+    }
+    $GraphVersion = $common | Sort-Object { [version]$_ } -Descending | Select-Object -First 1
+}
+foreach ($m in $graphModules) {
+    Import-Module $m -RequiredVersion $GraphVersion -ErrorAction Stop
+}
+Write-Host "    Microsoft.Graph $GraphVersion, PowerShell $($PSVersionTable.PSVersion)"
+
 Write-Step 'Verbinde mit Microsoft Graph'
 $scopes = @(
     'User.Read.All',
