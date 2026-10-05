@@ -30,6 +30,10 @@
 .PARAMETER Period
     Zeitraum der Nutzungsberichte (D7, D30, D90, D180). Standard: D90
 
+.PARAMETER UseDeviceCode
+    Anmeldung per Geraetecode (Code auf https://microsoft.com/devicelogin eingeben).
+    Hilft, wenn das Anmeldefenster nicht erscheint, z. B. in der PowerShell ISE oder auf einem Server.
+
 .PARAMETER IncludeTeamsPhone
     Prueft zusaetzlich mit dem MicrosoftTeams-Modul, wer Teams-Telefonie (Enterprise Voice) nutzt.
 
@@ -59,7 +63,8 @@ param(
     [int]$InactiveDays = 90,
     [ValidateSet('D7', 'D30', 'D90', 'D180')]
     [string]$Period = 'D90',
-    [switch]$IncludeTeamsPhone
+    [switch]$IncludeTeamsPhone,
+    [switch]$UseDeviceCode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -166,7 +171,17 @@ $scopes = @(
     'Reports.Read.All',       # Nutzungsberichte
     'ReportSettings.Read.All' # Pruefung Anonymisierung
 )
-Connect-MgGraph -Scopes $scopes -NoWelcome
+# Die Windows-Anmeldung (WAM) funktioniert in der PowerShell ISE und in eingebetteten Terminals nicht
+# ("A window handle must be configured"). Dort auf die normale Browser-Anmeldung ausweichen.
+if ($psISE -or $Host.Name -match 'ISE') {
+    try { Set-MgGraphOption -DisableLoginByWAM $true } catch { $UseDeviceCode = $true }
+}
+if ($UseDeviceCode) {
+    Connect-MgGraph -Scopes $scopes -NoWelcome -UseDeviceCode
+}
+else {
+    Connect-MgGraph -Scopes $scopes -NoWelcome
+}
 
 New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 $RawPath = Join-Path $OutputPath 'Rohdaten'
