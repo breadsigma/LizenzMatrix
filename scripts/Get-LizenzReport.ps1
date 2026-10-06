@@ -13,7 +13,11 @@
       03_E5-Kandidaten.csv       Nur die E5-Benutzer mit einer Empfehlung != "E5 behalten"
       Rohdaten\*.csv             Originale Microsoft-365-Nutzungsberichte
 
-    Datenquellen (Microsoft Graph):
+    Anmeldung: ueber das Az-Modul (Azure PowerShell). Das ist eine Microsoft-eigene App, die in
+    der Regel ohne Admin-Freigabe funktioniert. Das Microsoft.Graph-Modul wird NICHT benoetigt;
+    die Daten werden direkt per REST von Microsoft Graph gelesen.
+
+    Datenquellen (Microsoft Graph REST):
       - subscribedSkus                      Lizenzbestand
       - users (+ signInActivity)            Lizenzen, Zuweisung (direkt/Gruppe), letzte Anmeldung, AD-OU
       - getOffice365ActiveUserDetail        Letzte Aktivitaet Exchange / OneDrive / SharePoint / Teams
@@ -34,10 +38,8 @@
     Anmeldung per Geraetecode (Code auf https://microsoft.com/devicelogin eingeben).
     Hilft, wenn das Anmeldefenster nicht erscheint, z. B. in der PowerShell ISE oder auf einem Server.
 
-.PARAMETER GraphVersion
-    Version der Microsoft.Graph-Module, die geladen werden soll (z. B. 2.29.1).
-    Ohne Angabe wird die hoechste Version genommen, die fuer alle benoetigten Module installiert ist.
-    Verschiedene Versionen gemischt fuehren zu Fehlern wie "Could not load file or assembly".
+.PARAMETER TenantId
+    Tenant-ID oder Domain (z. B. zg.ch), falls das Konto in mehreren Tenants existiert.
 
 .PARAMETER IncludeTeamsPhone
     Prueft zusaetzlich mit dem MicrosoftTeams-Modul, wer Teams-Telefonie (Enterprise Voice) nutzt.
@@ -50,7 +52,7 @@
 
 .NOTES
     Voraussetzungen:
-      Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser
+      Install-Module Az.Accounts -Scope CurrentUser
       (optional) Install-Module MicrosoftTeams -Scope CurrentUser
       (optional) Install-Module ImportExcel -Scope CurrentUser   -> zusaetzlich eine .xlsx-Datei
 
@@ -70,7 +72,7 @@ param(
     [string]$Period = 'D90',
     [switch]$IncludeTeamsPhone,
     [switch]$UseDeviceCode,
-    [string]$GraphVersion
+    [string]$TenantId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -133,10 +135,65 @@ function Get-OuFromDn([string]$Dn) {
     return ($ous -join '/')
 }
 
+$Graph = 'https://graph.microsoft.com/v1.0'
+$script:GraphHeaders = $null
+
+function Get-GraphToken {
+    # Az 14+ liefert das Token als SecureString, aeltere Versionen als Text
+    $t = Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com' -ErrorAction Stop
+    $raw = $t.Token
+    if ($raw -is [securestring]) {
+        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($raw)
+        try { $raw = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+    }
+    $script:GraphHeaders = @{ Authorization = "Bearer $raw"; ConsistencyLevel = 'eventual' }
+}
+
+function Invoke-Graph([string]$Uri) {
+    # Einzelne GET-Abfrage (JSON)
+    if ($Uri -notmatch '^https://') { $Uri = "$Graph/$Uri" }
+    return Invoke-RestMethod -Method GET -Uri $Uri -Headers $script:GraphHeaders -ErrorAction Stop
+}
+
+function Get-GraphCollection([string]$Uri) {
+    # GET mit Paging (@odata.nextLink)
+    $all = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    while ($next) {
+        $page = Invoke-Graph $next
+        foreach ($v in $page.value) { $all.Add($v) }
+        $next = $page.'@odata.nextLink'
+        if ($all.Count -gt 0 -and $all.Count % 5000 -eq 0) { Write-Host "    ... $($all.Count)" }
+    }
+    return $all
+}
+
+function Save-GraphFile([string]$Uri, [string]$File) {
+    # Berichte liefern ein 302 auf eine vorab signierte Download-URL. Die darf OHNE
+    # Authorization-Header geladen werden, sonst lehnt der Speicher die Anfrage ab.
+    $location = $null
+    try {
+        $r = Invoke-WebRequest -Method GET -Uri $Uri -Headers $script:GraphHeaders -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop
+        if ($r.StatusCode -eq 200) { [IO.File]::WriteAllBytes($File, $r.Content); return }
+        $location = $r.Headers['Location']
+    }
+    catch {
+        $resp = $_.Exception.Response
+        if ($null -eq $resp) { throw }
+        $code = [int]$resp.StatusCode
+        if ($code -lt 300 -or $code -ge 400) { throw }
+        $location = if ($resp.Headers -is [System.Net.WebHeaderCollection]) { $resp.Headers['Location'] }
+                    else { [string]$resp.Headers.Location }
+    }
+    if (-not $location) { throw 'Keine Download-URL erhalten' }
+    Invoke-WebRequest -Uri $location -OutFile $File -UseBasicParsing -ErrorAction Stop
+}
+
 function Get-GraphReport([string]$Function, [string]$FileName) {
     $file = Join-Path $RawPath $FileName
     try {
-        Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/reports/$Function" -OutputFilePath $file | Out-Null
+        Save-GraphFile "$Graph/reports/$Function" $file
         $rows = Import-Csv -Path $file
         Write-Host "    $FileName : $($rows.Count) Zeilen"
         return $rows
@@ -168,56 +225,28 @@ function Export-Report($Data, [string]$Name) {
 # --------------------------------------------------------------------------------------------
 # 1. Verbinden
 # --------------------------------------------------------------------------------------------
-Write-Step 'Lade Microsoft.Graph-Module'
-# Alle Graph-Module muessen exakt dieselbe Version haben, sonst gibt es Assembly-Konflikte.
-$graphModules = 'Microsoft.Graph.Authentication', 'Microsoft.Graph.Users', 'Microsoft.Graph.Identity.DirectoryManagement'
-if (-not $GraphVersion) {
-    $common = @()
-    $first = $true
-    foreach ($m in $graphModules) {
-        $versions = @(Get-Module -ListAvailable -Name $m | ForEach-Object { $_.Version.ToString() })
-        if (-not $versions) { throw "Modul $m ist nicht installiert. Install-Module $m -Scope CurrentUser" }
-        if ($first) { $common = $versions; $first = $false }
-        else { $common = @($common | Where-Object { $versions -contains $_ }) }
-    }
-    if (-not $common) {
-        throw ('Die Graph-Module sind in unterschiedlichen Versionen installiert. Bitte alle in derselben Version installieren, z. B.: ' +
-            "Install-Module $($graphModules -join ', ') -RequiredVersion 2.29.1 -Scope CurrentUser -Force -AllowClobber")
-    }
-    $GraphVersion = $common | Sort-Object { [version]$_ } -Descending | Select-Object -First 1
+Write-Step 'Verbinde mit Azure (Az.Accounts)'
+if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
+    throw 'Das Modul Az.Accounts fehlt. Einmalig installieren: Install-Module Az.Accounts -Scope CurrentUser'
 }
-foreach ($m in $graphModules) {
-    Import-Module $m -RequiredVersion $GraphVersion -ErrorAction Stop
-}
-Write-Host "    Microsoft.Graph $GraphVersion, PowerShell $($PSVersionTable.PSVersion)"
+Import-Module Az.Accounts -ErrorAction Stop
+Write-Host "    Az.Accounts $((Get-Module Az.Accounts).Version), PowerShell $($PSVersionTable.PSVersion)"
 
-Write-Step 'Verbinde mit Microsoft Graph'
-$scopes = @(
-    'User.Read.All',
-    'Directory.Read.All',
-    'Organization.Read.All',
-    'AuditLog.Read.All',      # signInActivity
-    'Reports.Read.All',       # Nutzungsberichte
-    'ReportSettings.Read.All' # Pruefung Anonymisierung
-)
-# Die Windows-Anmeldung (WAM) funktioniert in der PowerShell ISE und in eingebetteten Terminals nicht
-# ("A window handle must be configured"). Dort auf die normale Browser-Anmeldung ausweichen.
-if ($psISE -or $Host.Name -match 'ISE') {
-    try { Set-MgGraphOption -DisableLoginByWAM $true } catch { $UseDeviceCode = $true }
-}
-if ($UseDeviceCode) {
-    Connect-MgGraph -Scopes $scopes -NoWelcome -UseDeviceCode
-}
-else {
-    Connect-MgGraph -Scopes $scopes -NoWelcome
-}
+# Keine Azure-Subscription noetig - wir brauchen nur ein Token fuer Microsoft Graph.
+$connectArgs = @{ ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue' }
+if ($TenantId) { $connectArgs.Tenant = $TenantId }
+if ($UseDeviceCode -or $psISE -or $Host.Name -match 'ISE') { $connectArgs.UseDeviceAuthentication = $true }
+$null = Connect-AzAccount @connectArgs
+$ctx = Get-AzContext
+Write-Host "    Angemeldet als $($ctx.Account.Id), Tenant $($ctx.Tenant.Id)"
+Get-GraphToken
 
 New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 $RawPath = Join-Path $OutputPath 'Rohdaten'
 New-Item -ItemType Directory -Path $RawPath -Force | Out-Null
 
 try {
-    $reportSettings = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/admin/reportSettings'
+    $reportSettings = Invoke-Graph 'admin/reportSettings'
     if ($reportSettings.displayConcealedNames) {
         Write-Warning ('Die Nutzungsberichte sind anonymisiert (displayConcealedNames = true). ' +
             'Nutzungsdaten koennen den Benutzern NICHT zugeordnet werden. ' +
@@ -242,7 +271,7 @@ catch {
     Write-Warning 'Offizielle Produktnamen-Liste nicht erreichbar, verwende interne Liste.'
 }
 
-$skus = Get-MgSubscribedSku -All
+$skus = Get-GraphCollection 'subscribedSkus'
 $SkuById = @{}
 foreach ($sku in $skus) { $SkuById[[string]$sku.SkuId] = $sku }
 
@@ -274,7 +303,16 @@ $userProps = @(
     'createdDateTime', 'onPremisesSyncEnabled', 'onPremisesDistinguishedName',
     'assignedLicenses', 'licenseAssignmentStates', 'signInActivity'
 )
-$users = Get-MgUser -All -Property $userProps
+$select = $userProps -join ','
+try {
+    $users = Get-GraphCollection "users?`$select=$select&`$top=999"
+}
+catch {
+    # signInActivity braucht AuditLog.Read.All. Falls das fehlt: ohne letzte Anmeldung weiterarbeiten.
+    Write-Warning "Letzte Anmeldung (signInActivity) nicht lesbar, lade Benutzer ohne dieses Feld. ($($_.Exception.Message))"
+    $select = ($userProps | Where-Object { $_ -ne 'signInActivity' }) -join ','
+    $users = Get-GraphCollection "users?`$select=$select&`$top=999"
+}
 Write-Host "    $($users.Count) Benutzer"
 
 # --------------------------------------------------------------------------------------------
@@ -379,7 +417,7 @@ $result = foreach ($u in $users) {
             $empfehlung = 'Lizenz entfernen'
             $begruendung.Add('Konto ist deaktiviert')
         }
-        elseif ($null -eq $lastSignIn -and $u.CreatedDateTime -and $u.CreatedDateTime -lt $cutoff) {
+        elseif ($null -eq $lastSignIn -and (ConvertTo-Date $u.CreatedDateTime) -and (ConvertTo-Date $u.CreatedDateTime) -lt $cutoff) {
             $empfehlung = 'Lizenz entfernen / pruefen'
             $begruendung.Add('Noch nie angemeldet')
         }
