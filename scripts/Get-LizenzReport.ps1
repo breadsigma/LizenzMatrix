@@ -49,9 +49,17 @@
 .PARAMETER Account
     E-Mail-Adresse des Kontos, mit dem angemeldet werden soll (wird im Anmeldefenster vorausgefuellt).
 
+.PARAMETER Client
+    Mit welcher (Microsoft-)App sich das Script anmeldet. Die App bestimmt, welche Berechtigungen
+    das Token hat (Zeile "Berechtigungen:" in der Ausgabe):
+      AzurePowerShell  Standard. Funktioniert ohne Freigabe, liefert aber evtl. keine Anmelde-/Nutzungsdaten.
+      AzureCli         Ebenfalls Microsoft-eigen, ohne Freigabe; hat teils mehr Berechtigungen.
+      GraphCli         "Microsoft Graph Command Line Tools": fordert alle noetigen Berechtigungen an,
+                       braucht aber einmalig die Freigabe durch einen Global Admin (Admin Consent).
+
 .PARAMETER RequestScopes
-    Fordert die benoetigten Berechtigungen bei der Anmeldung explizit an (Zustimmungsdialog).
-    Standard: nur die bereits freigegebenen Berechtigungen verwenden (kein Dialog).
+    Fordert die benoetigten Berechtigungen explizit an. Nur mit -Client GraphCli sinnvoll;
+    Microsoft-eigene Apps lehnen das ab (AADSTS65002).
 
 .PARAMETER IncludeTeamsPhone
     Prueft zusaetzlich mit dem MicrosoftTeams-Modul, wer Teams-Telefonie (Enterprise Voice) nutzt.
@@ -85,6 +93,8 @@ param(
     [switch]$IncludeTeamsPhone,
     [switch]$UseDeviceCode,
     [string]$TenantId,
+    [ValidateSet('AzurePowerShell', 'AzureCli', 'GraphCli')]
+    [string]$Client = 'AzurePowerShell',
     [switch]$RequestScopes,
     [switch]$NoBrowser,
     [string]$Account
@@ -156,8 +166,14 @@ $script:GraphHeaders = $null
 # --------------------------------------------------------------------------------------------
 # Anmeldung (OAuth 2.0 Authorization Code + PKCE, ohne Zusatzmodule)
 # --------------------------------------------------------------------------------------------
-# Client-ID von "Microsoft Azure PowerShell" (Microsoft-eigene oeffentliche App, erlaubt http://localhost)
-$script:ClientId = '1950a258-227b-4e31-a9cf-717495945fc2'
+# Oeffentliche Client-IDs (alle erlauben http://localhost als Redirect)
+$script:ClientIds = @{
+    AzurePowerShell = '1950a258-227b-4e31-a9cf-717495945fc2'   # Microsoft Azure PowerShell
+    AzureCli        = '04b07795-8ddb-461a-bbee-02f9e1bf7b46'   # Microsoft Azure CLI
+    GraphCli        = '14d82eec-204b-4c2f-b7e8-296a70dab67e'   # Microsoft Graph Command Line Tools
+}
+$script:ClientId = $script:ClientIds[$Client]
+if ($Client -eq 'GraphCli') { $RequestScopes = $true }   # diese App muss die Scopes explizit anfordern
 $script:Auth = $null   # access_token, refresh_token, expires (DateTime)
 
 function ConvertTo-Base64Url([byte[]]$Bytes) {
@@ -426,7 +442,7 @@ function Export-Report($Data, [string]$Name) {
 # 1. Verbinden
 # --------------------------------------------------------------------------------------------
 Write-Step 'Anmeldung bei Microsoft'
-Write-Host "    PowerShell $($PSVersionTable.PSVersion), ohne Zusatzmodule"
+Write-Host "    PowerShell $($PSVersionTable.PSVersion), ohne Zusatzmodule, App: $Client"
 # Windows PowerShell 5.1: TLS 1.2 erzwingen, sonst lehnt login.microsoftonline.com ab
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Add-Type -AssemblyName System.Web
