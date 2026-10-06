@@ -19,6 +19,8 @@ cd C:\Pfad\zum\Script
 Unblock-File .\Get-LizenzReport.ps1
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\Get-LizenzReport.ps1                             # Standard: 90 Tage, Browser-Anmeldung
+.\Get-LizenzReport.ps1 -NoBrowser                  # auf einem Server: Link auf dem eigenen PC öffnen, Adresse zurück einfügen
+.\Get-LizenzReport.ps1 -Account name@zg.ch         # Konto im Anmeldefenster vorausfüllen
 .\Get-LizenzReport.ps1 -RequestScopes              # falls Berechtigungen im Token fehlen (Zustimmungsdialog)
 .\Get-LizenzReport.ps1 -IncludeTeamsPhone          # prüft zusätzlich Teams-Telefonie (Modul MicrosoftTeams)
 ```

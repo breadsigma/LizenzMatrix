@@ -41,6 +41,14 @@
 .PARAMETER TenantId
     Tenant-ID oder Domain (z. B. zg.ch), falls das Konto in mehreren Tenants existiert.
 
+.PARAMETER NoBrowser
+    Oeffnet keinen Browser auf diesem Rechner (z. B. auf einem Server per Remotedesktop).
+    Das Script zeigt den Anmelde-Link an. Diesen auf dem eigenen PC im Browser oeffnen, anmelden,
+    und danach die Adresse aus der Adresszeile (beginnt mit http://localhost/?code=...) hier einfuegen.
+
+.PARAMETER Account
+    E-Mail-Adresse des Kontos, mit dem angemeldet werden soll (wird im Anmeldefenster vorausgefuellt).
+
 .PARAMETER RequestScopes
     Fordert die benoetigten Berechtigungen bei der Anmeldung explizit an (Zustimmungsdialog).
     Standard: nur die bereits freigegebenen Berechtigungen verwenden (kein Dialog).
@@ -77,7 +85,9 @@ param(
     [switch]$IncludeTeamsPhone,
     [switch]$UseDeviceCode,
     [string]$TenantId,
-    [switch]$RequestScopes
+    [switch]$RequestScopes,
+    [switch]$NoBrowser,
+    [string]$Account
 )
 
 $ErrorActionPreference = 'Stop'
@@ -190,6 +200,52 @@ function Invoke-TokenEndpoint([hashtable]$Body) {
     }
 }
 
+function New-Pkce {
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $buf = New-Object byte[] 32; $rng.GetBytes($buf); $verifier = ConvertTo-Base64Url $buf
+    $rng.GetBytes($buf); $state = ConvertTo-Base64Url $buf
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $challenge = ConvertTo-Base64Url ($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($verifier)))
+    return @{ verifier = $verifier; state = $state; challenge = $challenge }
+}
+
+function Get-AuthorizeUrl([string]$Redirect, [hashtable]$Pkce) {
+    $tenant = if ($TenantId) { $TenantId } else { 'organizations' }
+    $url = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/authorize?" +
+        "client_id=$script:ClientId&response_type=code&redirect_uri=$([uri]::EscapeDataString($Redirect))" +
+        "&response_mode=query&scope=$([uri]::EscapeDataString((Get-AuthScopes)))" +
+        "&state=$($Pkce.state)&code_challenge=$($Pkce.challenge)&code_challenge_method=S256"
+    if ($Account) { $url += "&login_hint=$([uri]::EscapeDataString($Account))" } else { $url += '&prompt=select_account' }
+    return $url
+}
+
+function Connect-GraphManual {
+    # Kein Browser auf diesem Rechner: Link anzeigen, Antwort-Adresse einfuegen lassen
+    $redirect = 'http://localhost'
+    $pkce = New-Pkce
+    $url = Get-AuthorizeUrl $redirect $pkce
+    Write-Host ''
+    Write-Host '    1. Diesen Link auf dem eigenen PC im Browser oeffnen und anmelden:' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host "    $url"
+    Write-Host ''
+    Write-Host '    2. Nach der Anmeldung zeigt der Browser eine Fehlerseite ("Seite nicht erreichbar"). Das ist normal.' -ForegroundColor Yellow
+    Write-Host '    3. Die komplette Adresse aus der Adresszeile kopieren (beginnt mit http://localhost/?code=) und hier einfuegen.' -ForegroundColor Yellow
+    Write-Host ''
+    $pasted = Read-Host '    Adresse einfuegen'
+    $pasted = $pasted.Trim()
+    if ($pasted -notmatch '^https?://') { $pasted = "http://localhost/?$($pasted.TrimStart('?'))" }
+    $query = [System.Web.HttpUtility]::ParseQueryString(([uri]$pasted).Query)
+    if ($query['error']) { throw "Anmeldung abgelehnt: $($query['error']) - $($query['error_description'])" }
+    if ($query['state'] -ne $pkce.state) { throw 'Die eingefuegte Adresse passt nicht zu dieser Anmeldung (state). Bitte Script neu starten.' }
+    if (-not $query['code']) { throw 'In der eingefuegten Adresse fehlt der Code (code=...).' }
+    $resp = Invoke-TokenEndpoint @{
+        client_id = $script:ClientId; grant_type = 'authorization_code'; code = $query['code']
+        redirect_uri = $redirect; code_verifier = $pkce.verifier; scope = (Get-AuthScopes)
+    }
+    Set-AuthFromTokenResponse $resp
+}
+
 function Connect-GraphBrowser {
     # Lokaler Listener auf 127.0.0.1 (kein HttpListener -> keine Adminrechte / URL-ACL noetig)
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
@@ -197,17 +253,9 @@ function Connect-GraphBrowser {
     $port = $listener.LocalEndpoint.Port
     $redirect = "http://localhost:$port"
 
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $buf = New-Object byte[] 32; $rng.GetBytes($buf); $verifier = ConvertTo-Base64Url $buf
-    $rng.GetBytes($buf); $state = ConvertTo-Base64Url $buf
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    $challenge = ConvertTo-Base64Url ($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($verifier)))
-
-    $tenant = if ($TenantId) { $TenantId } else { 'organizations' }
-    $url = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/authorize?" +
-        "client_id=$script:ClientId&response_type=code&redirect_uri=$([uri]::EscapeDataString($redirect))" +
-        "&response_mode=query&scope=$([uri]::EscapeDataString((Get-AuthScopes)))" +
-        "&state=$state&code_challenge=$challenge&code_challenge_method=S256&prompt=select_account"
+    $pkce = New-Pkce
+    $verifier = $pkce.verifier; $state = $pkce.state
+    $url = Get-AuthorizeUrl $redirect $pkce
 
     Write-Host '    Browser wird geoeffnet. Bitte dort anmelden ...'
     Write-Host "    Falls kein Fenster erscheint, diese Adresse im Browser oeffnen:`n    $url"
@@ -383,7 +431,9 @@ Write-Host "    PowerShell $($PSVersionTable.PSVersion), ohne Zusatzmodule"
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Add-Type -AssemblyName System.Web
 
-if ($UseDeviceCode) { Connect-GraphDeviceCode } else { Connect-GraphBrowser }
+if ($UseDeviceCode) { Connect-GraphDeviceCode }
+elseif ($NoBrowser) { Connect-GraphManual }
+else { Connect-GraphBrowser }
 $ti = Get-TokenInfo
 if ($ti) {
     Write-Host "    Angemeldet als $($ti.upn), Tenant $($ti.tid)"
