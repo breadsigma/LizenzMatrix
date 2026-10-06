@@ -13,9 +13,9 @@
       03_E5-Kandidaten.csv       Nur die E5-Benutzer mit einer Empfehlung != "E5 behalten"
       Rohdaten\*.csv             Originale Microsoft-365-Nutzungsberichte
 
-    Anmeldung: ueber das Az-Modul (Azure PowerShell). Das ist eine Microsoft-eigene App, die in
-    der Regel ohne Admin-Freigabe funktioniert. Das Microsoft.Graph-Modul wird NICHT benoetigt;
-    die Daten werden direkt per REST von Microsoft Graph gelesen.
+    Anmeldung: OHNE Zusatzmodule. Das Script oeffnet den Browser, meldet sich wie Azure PowerShell
+    (Microsoft-eigene App, keine Admin-Freigabe noetig) per OAuth an und liest die Daten direkt
+    per REST von Microsoft Graph. Es werden weder Microsoft.Graph noch Az benoetigt.
 
     Datenquellen (Microsoft Graph REST):
       - subscribedSkus                      Lizenzbestand
@@ -41,6 +41,10 @@
 .PARAMETER TenantId
     Tenant-ID oder Domain (z. B. zg.ch), falls das Konto in mehreren Tenants existiert.
 
+.PARAMETER RequestScopes
+    Fordert die benoetigten Berechtigungen bei der Anmeldung explizit an (Zustimmungsdialog).
+    Standard: nur die bereits freigegebenen Berechtigungen verwenden (kein Dialog).
+
 .PARAMETER IncludeTeamsPhone
     Prueft zusaetzlich mit dem MicrosoftTeams-Modul, wer Teams-Telefonie (Enterprise Voice) nutzt.
 
@@ -52,7 +56,7 @@
 
 .NOTES
     Voraussetzungen:
-      Install-Module Az.Accounts -Scope CurrentUser
+      keine - nur Windows PowerShell 5.1 oder PowerShell 7
       (optional) Install-Module MicrosoftTeams -Scope CurrentUser
       (optional) Install-Module ImportExcel -Scope CurrentUser   -> zusaetzlich eine .xlsx-Datei
 
@@ -72,7 +76,8 @@ param(
     [string]$Period = 'D90',
     [switch]$IncludeTeamsPhone,
     [switch]$UseDeviceCode,
-    [string]$TenantId
+    [string]$TenantId,
+    [switch]$RequestScopes
 )
 
 $ErrorActionPreference = 'Stop'
@@ -138,20 +143,166 @@ function Get-OuFromDn([string]$Dn) {
 $Graph = 'https://graph.microsoft.com/v1.0'
 $script:GraphHeaders = $null
 
-function Get-GraphToken {
-    # Az 14+ liefert das Token als SecureString, aeltere Versionen als Text
-    $t = Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com' -ErrorAction Stop
-    $raw = $t.Token
-    if ($raw -is [securestring]) {
-        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($raw)
-        try { $raw = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+# --------------------------------------------------------------------------------------------
+# Anmeldung (OAuth 2.0 Authorization Code + PKCE, ohne Zusatzmodule)
+# --------------------------------------------------------------------------------------------
+# Client-ID von "Microsoft Azure PowerShell" (Microsoft-eigene oeffentliche App, erlaubt http://localhost)
+$script:ClientId = '1950a258-227b-4e31-a9cf-717495945fc2'
+$script:Auth = $null   # access_token, refresh_token, expires (DateTime)
+
+function ConvertTo-Base64Url([byte[]]$Bytes) {
+    return [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function Get-AuthScopes {
+    if ($RequestScopes) {
+        return 'https://graph.microsoft.com/User.Read.All https://graph.microsoft.com/Directory.Read.All ' +
+               'https://graph.microsoft.com/Organization.Read.All https://graph.microsoft.com/AuditLog.Read.All ' +
+               'https://graph.microsoft.com/Reports.Read.All https://graph.microsoft.com/ReportSettings.Read.All offline_access'
     }
-    $script:GraphHeaders = @{ Authorization = "Bearer $raw"; ConsistencyLevel = 'eventual' }
+    return 'https://graph.microsoft.com/.default offline_access'
+}
+
+function Set-AuthFromTokenResponse($Response) {
+    $script:Auth = @{
+        access_token  = $Response.access_token
+        refresh_token = $Response.refresh_token
+        expires       = (Get-Date).AddSeconds([int]$Response.expires_in - 120)
+    }
+    $script:GraphHeaders = @{ Authorization = "Bearer $($Response.access_token)"; ConsistencyLevel = 'eventual' }
+}
+
+function Invoke-TokenEndpoint([hashtable]$Body) {
+    $tenant = if ($TenantId) { $TenantId } else { 'organizations' }
+    try {
+        return Invoke-RestMethod -Method POST -Uri "https://login.microsoftonline.com/$tenant/oauth2/v2.0/token" `
+            -ContentType 'application/x-www-form-urlencoded' -Body $Body -ErrorAction Stop
+    }
+    catch {
+        $detail = $_.ErrorDetails.Message
+        if (-not $detail -and $_.Exception.Response) {
+            try { $detail = (New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())).ReadToEnd() } catch {}
+        }
+        if ($detail) {
+            try { $j = $detail | ConvertFrom-Json; $detail = "$($j.error): $($j.error_description)" } catch {}
+        }
+        throw "Token-Anfrage fehlgeschlagen: $detail $($_.Exception.Message)"
+    }
+}
+
+function Connect-GraphBrowser {
+    # Lokaler Listener auf 127.0.0.1 (kein HttpListener -> keine Adminrechte / URL-ACL noetig)
+    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $port = $listener.LocalEndpoint.Port
+    $redirect = "http://localhost:$port"
+
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $buf = New-Object byte[] 32; $rng.GetBytes($buf); $verifier = ConvertTo-Base64Url $buf
+    $rng.GetBytes($buf); $state = ConvertTo-Base64Url $buf
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $challenge = ConvertTo-Base64Url ($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($verifier)))
+
+    $tenant = if ($TenantId) { $TenantId } else { 'organizations' }
+    $url = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/authorize?" +
+        "client_id=$script:ClientId&response_type=code&redirect_uri=$([uri]::EscapeDataString($redirect))" +
+        "&response_mode=query&scope=$([uri]::EscapeDataString((Get-AuthScopes)))" +
+        "&state=$state&code_challenge=$challenge&code_challenge_method=S256&prompt=select_account"
+
+    Write-Host '    Browser wird geoeffnet. Bitte dort anmelden ...'
+    Write-Host "    Falls kein Fenster erscheint, diese Adresse im Browser oeffnen:`n    $url"
+    try { Start-Process $url | Out-Null } catch { }
+
+    $code = $null
+    try {
+        $deadline = (Get-Date).AddMinutes(5)
+        while ($null -eq $code) {
+            if ((Get-Date) -gt $deadline) { throw 'Keine Anmeldung innerhalb von 5 Minuten.' }
+            if (-not $listener.Pending()) { Start-Sleep -Milliseconds 200; continue }
+            $client = $listener.AcceptTcpClient()
+            try {
+                $stream = $client.GetStream()
+                $reader = New-Object IO.StreamReader($stream)
+                $requestLine = $reader.ReadLine()
+                # restliche Header lesen und verwerfen
+                while (($line = $reader.ReadLine()) -ne $null -and $line -ne '') { }
+                $path = ($requestLine -split ' ')[1]
+                $query = [System.Web.HttpUtility]::ParseQueryString(([uri]"http://localhost$path").Query)
+                $msg = 'Anmeldung fehlgeschlagen. Dieses Fenster kann geschlossen werden.'
+                if ($query['state'] -eq $state -and $query['code']) {
+                    $code = $query['code']
+                    $msg = 'Anmeldung erfolgreich. Dieses Fenster kann geschlossen werden.'
+                }
+                elseif ($query['error']) {
+                    $msg = "Fehler: $($query['error']) - $($query['error_description'])"
+                    Write-Warning $msg
+                }
+                $html = "<html><body style='font-family:sans-serif;padding:40px'><h2>Get-LizenzReport</h2><p>$msg</p></body></html>"
+                $bytes = [Text.Encoding]::UTF8.GetBytes($html)
+                $header = "HTTP/1.1 200 OK`r`nContent-Type: text/html; charset=utf-8`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
+                $hb = [Text.Encoding]::ASCII.GetBytes($header)
+                $stream.Write($hb, 0, $hb.Length); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush()
+                if ($query['error']) { throw "Anmeldung abgelehnt: $($query['error']) - $($query['error_description'])" }
+            }
+            finally { $client.Close() }
+        }
+    }
+    finally { $listener.Stop() }
+
+    $resp = Invoke-TokenEndpoint @{
+        client_id = $script:ClientId; grant_type = 'authorization_code'; code = $code
+        redirect_uri = $redirect; code_verifier = $verifier; scope = (Get-AuthScopes)
+    }
+    Set-AuthFromTokenResponse $resp
+}
+
+function Connect-GraphDeviceCode {
+    $tenant = if ($TenantId) { $TenantId } else { 'organizations' }
+    $dc = Invoke-RestMethod -Method POST -Uri "https://login.microsoftonline.com/$tenant/oauth2/v2.0/devicecode" `
+        -Body @{ client_id = $script:ClientId; scope = (Get-AuthScopes) } -ErrorAction Stop
+    Write-Host "    $($dc.message)" -ForegroundColor Yellow
+    $deadline = (Get-Date).AddSeconds([int]$dc.expires_in)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds ([int]$dc.interval)
+        try {
+            $resp = Invoke-RestMethod -Method POST -Uri "https://login.microsoftonline.com/$tenant/oauth2/v2.0/token" `
+                -Body @{ client_id = $script:ClientId; grant_type = 'urn:ietf:params:oauth:grant-type:device_code'; device_code = $dc.device_code } -ErrorAction Stop
+            Set-AuthFromTokenResponse $resp
+            return
+        }
+        catch {
+            $detail = $_.ErrorDetails.Message
+            if ($detail -match 'authorization_pending|slow_down') { continue }
+            throw "Geraetecode-Anmeldung fehlgeschlagen: $detail $($_.Exception.Message)"
+        }
+    }
+    throw 'Geraetecode abgelaufen.'
+}
+
+function Update-GraphToken {
+    # Token vor Ablauf still erneuern (grosse Tenants brauchen laenger als 1 Stunde)
+    if ($script:Auth -and (Get-Date) -ge $script:Auth.expires -and $script:Auth.refresh_token) {
+        $resp = Invoke-TokenEndpoint @{
+            client_id = $script:ClientId; grant_type = 'refresh_token'
+            refresh_token = $script:Auth.refresh_token; scope = (Get-AuthScopes)
+        }
+        Set-AuthFromTokenResponse $resp
+    }
+}
+
+function Get-TokenInfo {
+    # Payload des Access-Tokens lesen (nur zur Anzeige: Benutzer, Tenant, Berechtigungen)
+    try {
+        $part = ($script:Auth.access_token -split '\.')[1].Replace('-', '+').Replace('_', '/')
+        switch ($part.Length % 4) { 2 { $part += '==' } 3 { $part += '=' } }
+        return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($part)) | ConvertFrom-Json
+    }
+    catch { return $null }
 }
 
 function Invoke-Graph([string]$Uri) {
     # Einzelne GET-Abfrage (JSON)
+    Update-GraphToken
     if ($Uri -notmatch '^https://') { $Uri = "$Graph/$Uri" }
     return Invoke-RestMethod -Method GET -Uri $Uri -Headers $script:GraphHeaders -ErrorAction Stop
 }
@@ -172,6 +323,7 @@ function Get-GraphCollection([string]$Uri) {
 function Save-GraphFile([string]$Uri, [string]$File) {
     # Berichte liefern ein 302 auf eine vorab signierte Download-URL. Die darf OHNE
     # Authorization-Header geladen werden, sonst lehnt der Speicher die Anfrage ab.
+    Update-GraphToken
     $location = $null
     try {
         $r = Invoke-WebRequest -Method GET -Uri $Uri -Headers $script:GraphHeaders -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop
@@ -225,21 +377,23 @@ function Export-Report($Data, [string]$Name) {
 # --------------------------------------------------------------------------------------------
 # 1. Verbinden
 # --------------------------------------------------------------------------------------------
-Write-Step 'Verbinde mit Azure (Az.Accounts)'
-if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
-    throw 'Das Modul Az.Accounts fehlt. Einmalig installieren: Install-Module Az.Accounts -Scope CurrentUser'
-}
-Import-Module Az.Accounts -ErrorAction Stop
-Write-Host "    Az.Accounts $((Get-Module Az.Accounts).Version), PowerShell $($PSVersionTable.PSVersion)"
+Write-Step 'Anmeldung bei Microsoft'
+Write-Host "    PowerShell $($PSVersionTable.PSVersion), ohne Zusatzmodule"
+# Windows PowerShell 5.1: TLS 1.2 erzwingen, sonst lehnt login.microsoftonline.com ab
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+Add-Type -AssemblyName System.Web
 
-# Keine Azure-Subscription noetig - wir brauchen nur ein Token fuer Microsoft Graph.
-$connectArgs = @{ ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue' }
-if ($TenantId) { $connectArgs.Tenant = $TenantId }
-if ($UseDeviceCode -or $psISE -or $Host.Name -match 'ISE') { $connectArgs.UseDeviceAuthentication = $true }
-$null = Connect-AzAccount @connectArgs
-$ctx = Get-AzContext
-Write-Host "    Angemeldet als $($ctx.Account.Id), Tenant $($ctx.Tenant.Id)"
-Get-GraphToken
+if ($UseDeviceCode) { Connect-GraphDeviceCode } else { Connect-GraphBrowser }
+$ti = Get-TokenInfo
+if ($ti) {
+    Write-Host "    Angemeldet als $($ti.upn), Tenant $($ti.tid)"
+    Write-Host "    Berechtigungen: $($ti.scp)"
+    foreach ($need in 'User.Read.All', 'AuditLog.Read.All', 'Reports.Read.All') {
+        if ($ti.scp -notmatch [regex]::Escape($need)) {
+            Write-Warning "Berechtigung $need fehlt im Token. Falls Daten fehlen: Script mit -RequestScopes starten."
+        }
+    }
+}
 
 New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 $RawPath = Join-Path $OutputPath 'Rohdaten'
