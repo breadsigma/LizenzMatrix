@@ -9,7 +9,7 @@ feste Regeln für den Entzug ungenutzter Lizenzen.
 | [`docs/Lizenzmatrix-v2.png`](docs/Lizenzmatrix-v2.png) | Entscheidungsbaum als Bild (Mermaid-Quelle im Markdown, in draw.io importierbar) |
 | [`scripts/Get-LizenzReport.ps1`](scripts/Get-LizenzReport.ps1) | Liest Lizenzen, letzte Anmeldung und Nutzung aus Entra ID / Microsoft 365 und markiert Entzugs- und P2-Kandidaten. Nur lesend. |
 | [`scripts/New-LizenzAuswertung.ps1`](scripts/New-LizenzAuswertung.ps1) | Wertet einen Report-Ordner aus: Kandidatenlisten (gesamt, pro Amt, pro EmployeeType), Sparpotenzial, HTML-Bericht mit Grafiken. |
-| [`scripts/Check-LizenzGruppeAD.ps1`](scripts/Check-LizenzGruppeAD.ps1) | Einfache Variante für die ISE: prüft die Mitglieder der lokalen AD-Lizenzgruppe mit `Get-ADUser` (Domänen-Anmeldung), ohne Cloud. |
+| [`scripts/Check-LicenseGroupAD.ps1`](scripts/Check-LicenseGroupAD.ps1) | Einfache Variante für die ISE: prüft die Mitglieder der lokalen AD-Lizenzgruppe mit `Get-ADUser` (Domänen-Anmeldung), ohne Cloud. |
 
 Die Auswertungen mit Personendaten (Berichte, Kandidatenlisten) werden **nicht** im Repo abgelegt.
 
@@ -42,7 +42,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ## Variante ohne Cloud: AD-Lizenzgruppe prüfen
 
-`Check-LizenzGruppeAD.ps1` läuft in der PowerShell ISE auf einem Server mit AD-Modul (RSAT). Oben im Script
+`Check-LicenseGroupAD.ps1` läuft in der PowerShell ISE auf einem Server mit AD-Modul (RSAT). Oben im Script
 den Gruppennamen eintragen, F5. Es liest pro Mitglied `Enabled`, `whenCreated`, `LastLogonDate`,
 `AccountExpirationDate` und ordnet Status und Massnahme zu. Ausgabe nach `C:\Temp\Lizenzcheck_<Datum>`.
 Der Entzug ist als `-WhatIf`-Block auskommentiert.
