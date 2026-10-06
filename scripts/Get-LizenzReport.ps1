@@ -469,7 +469,14 @@ $SkuNames = @{} + $SkuNameFallback
 try {
     $csvUrl = 'https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv'
     $productCsv = Invoke-RestMethod -Uri $csvUrl -TimeoutSec 30 | ConvertFrom-Csv
-    foreach ($p in $productCsv) { $SkuNames[$p.String_Id] = $p.Product_Display_Name }
+    # Die Microsoft-CSV hat ein BOM vor der ersten Spalte, daher Spalten ueber Muster suchen
+    $cols = @($productCsv[0].PSObject.Properties.Name)
+    $colId   = $cols | Where-Object { $_ -match 'String_Id' } | Select-Object -First 1
+    $colName = $cols | Where-Object { $_ -match 'Product_Display_Name' } | Select-Object -First 1
+    foreach ($p in $productCsv) {
+        $id = [string]$p.$colId; $name = [string]$p.$colName
+        if ($id -and $name) { $SkuNames[$id] = $name }
+    }
 }
 catch {
     Write-Warning 'Offizielle Produktnamen-Liste nicht erreichbar, verwende interne Liste.'
@@ -480,7 +487,7 @@ $SkuById = @{}
 foreach ($sku in $skus) { $SkuById[[string]$sku.SkuId] = $sku }
 
 function Get-SkuName([string]$PartNumber) {
-    if ($SkuNames.ContainsKey($PartNumber)) { return $SkuNames[$PartNumber] }
+    if ($SkuNames.ContainsKey($PartNumber) -and $SkuNames[$PartNumber]) { return $SkuNames[$PartNumber] }
     return $PartNumber
 }
 
@@ -552,6 +559,17 @@ if ($IncludeTeamsPhone) {
 # 5. Auswertung pro Benutzer
 # --------------------------------------------------------------------------------------------
 Write-Step 'Werte Benutzer aus'
+# Datenqualitaet: Ohne Anmelde- bzw. Nutzungsdaten duerfen keine Entzugs-Empfehlungen gemacht werden
+$HasSignInData = [bool]($users | Where-Object { $_.SignInActivity.LastSignInDateTime -or $_.SignInActivity.LastNonInteractiveSignInDateTime } | Select-Object -First 1)
+$HasUsageData  = ($activeUsers.Count -gt 0) -or ($activations.Count -gt 0)
+if (-not $HasSignInData) {
+    Write-Warning ('KEINE Anmeldedaten (signInActivity) erhalten. Inaktive Konten koennen nicht erkannt werden. ' +
+        'Ursache meist: Berechtigung AuditLog.Read.All fehlt -> Script mit -RequestScopes starten.')
+}
+if (-not $HasUsageData) {
+    Write-Warning ('KEINE Nutzungsberichte erhalten. E5-Kandidaten koennen nicht erkannt werden. ' +
+        'Ursache meist: Berechtigung Reports.Read.All fehlt (-RequestScopes) oder Berichte sind anonymisiert.')
+}
 $cutoff = (Get-Date).AddDays(-$InactiveDays)
 
 $result = foreach ($u in $users) {
@@ -621,13 +639,16 @@ $result = foreach ($u in $users) {
             $empfehlung = 'Lizenz entfernen'
             $begruendung.Add('Konto ist deaktiviert')
         }
-        elseif ($null -eq $lastSignIn -and (ConvertTo-Date $u.CreatedDateTime) -and (ConvertTo-Date $u.CreatedDateTime) -lt $cutoff) {
+        elseif ($HasSignInData -and $null -eq $lastSignIn -and (ConvertTo-Date $u.CreatedDateTime) -and (ConvertTo-Date $u.CreatedDateTime) -lt $cutoff) {
             $empfehlung = 'Lizenz entfernen / pruefen'
             $begruendung.Add('Noch nie angemeldet')
         }
         elseif ($null -ne $daysSinceSignIn -and $daysSinceSignIn -gt $InactiveDays) {
             $empfehlung = 'Lizenz entfernen / pruefen'
             $begruendung.Add("Seit $daysSinceSignIn Tagen nicht angemeldet")
+        }
+        elseif ($has.E5 -and -not $HasUsageData) {
+            $empfehlung = 'Unbestimmt (keine Nutzungsdaten)'
         }
         elseif ($has.E5) {
             if ($hasVoice) {
