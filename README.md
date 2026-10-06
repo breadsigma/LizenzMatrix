@@ -7,7 +7,9 @@ feste Regeln für den Entzug ungenutzter Lizenzen.
 |---|---|
 | [`docs/Lizenzmatrix-v2.md`](docs/Lizenzmatrix-v2.md) | Neue Matrix (Entscheidungsbaum), Voraussetzungen pro Persona, Betriebsregeln, Vorgehen bei der Umstellung, Gruppenstruktur |
 | [`docs/Lizenzmatrix-v2.png`](docs/Lizenzmatrix-v2.png) | Entscheidungsbaum als Bild (Mermaid-Quelle im Markdown, in draw.io importierbar) |
-| [`scripts/Get-LizenzReport.ps1`](scripts/Get-LizenzReport.ps1) | Liest Lizenzen, letzte Anmeldung und Nutzung aus und markiert Entzugs- und P2-Kandidaten. Nur lesend. |
+| [`scripts/Get-LizenzReport.ps1`](scripts/Get-LizenzReport.ps1) | Liest Lizenzen, letzte Anmeldung und Nutzung aus Entra ID / Microsoft 365 und markiert Entzugs- und P2-Kandidaten. Nur lesend. |
+| [`scripts/New-LizenzAuswertung.ps1`](scripts/New-LizenzAuswertung.ps1) | Wertet einen Report-Ordner aus: Kandidatenlisten (gesamt, pro Amt, pro EmployeeType), Sparpotenzial, HTML-Bericht mit Grafiken. |
+| [`scripts/Check-LizenzGruppeAD.ps1`](scripts/Check-LizenzGruppeAD.ps1) | Einfache Variante für die ISE: prüft die Mitglieder der lokalen AD-Lizenzgruppe mit `Get-ADUser` (Domänen-Anmeldung), ohne Cloud. |
 
 Die Auswertungen mit Personendaten (Berichte, Kandidatenlisten) werden **nicht** im Repo abgelegt.
 
@@ -30,7 +32,23 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 # Mit Nutzungsberichten (braucht Admin Consent für "Microsoft Graph Command Line Tools")
 .\Get-LizenzReport.ps1 -Account admin@zg.ch -Client GraphCli -NoBrowser
+
+# Report und Auswertung in einem Schritt
+.\Get-LizenzReport.ps1 -Account admin@zg.ch -Client AzureCli -NoBrowser -Auswertung
+
+# Auswertung eines bestehenden Reports, mit Vertragspreis
+.\New-LizenzAuswertung.ps1 -ReportPath .\LizenzReport_2026-10-06 -PreisE5 38.20
 ```
+
+## Variante ohne Cloud: AD-Lizenzgruppe prüfen
+
+`Check-LizenzGruppeAD.ps1` läuft in der PowerShell ISE auf einem Server mit AD-Modul (RSAT). Oben im Script
+den Gruppennamen eintragen, F5. Es liest pro Mitglied `Enabled`, `whenCreated`, `LastLogonDate`,
+`AccountExpirationDate` und ordnet Status und Massnahme zu. Ausgabe nach `C:\Temp\Lizenzcheck_<Datum>`.
+Der Entzug ist als `-WhatIf`-Block auskommentiert.
+
+Hinweis: `LastLogonDate` ist die letzte **Domänen**-Anmeldung (Laptop, VDI), nicht die Cloud-Anmeldung.
+Für Konten ohne Kantonslaptop ist der Cloud-Report die verlässlichere Quelle.
 
 ### Benötigte Rollen (vorher in PIM aktivieren)
 

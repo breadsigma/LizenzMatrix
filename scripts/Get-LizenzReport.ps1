@@ -65,6 +65,10 @@
     Fordert die benoetigten Berechtigungen explizit an. Nur mit -Client GraphCli sinnvoll;
     Microsoft-eigene Apps lehnen das ab (AADSTS65002).
 
+.PARAMETER Auswertung
+    Startet nach dem Export automatisch New-LizenzAuswertung.ps1 (muss im selben Ordner liegen)
+    und erzeugt Kandidatenlisten und den HTML-Bericht im Unterordner Auswertung.
+
 .PARAMETER IncludeTeamsPhone
     Prueft zusaetzlich mit dem MicrosoftTeams-Modul, wer Teams-Telefonie (Enterprise Voice) nutzt.
 
@@ -96,6 +100,7 @@ param(
     [ValidateSet('D7', 'D30', 'D90', 'D180')]
     [string]$Period = 'D90',
     [switch]$IncludeTeamsPhone,
+    [switch]$Auswertung,
     [switch]$UseDeviceCode,
     [string]$TenantId,
     [ValidateSet('AzurePowerShell', 'AzureCli', 'GraphCli')]
@@ -798,3 +803,11 @@ $licensed | Where-Object Hat_E5 | Group-Object EmployeeType, Firma | Sort-Object
 $dupeCount = @($licensed | Where-Object { $_.Begruendung -like '*Doppellizenz*' }).Count
 Write-Host "Benutzer mit Doppellizenzen: $dupeCount"
 Write-Host "Fertig. Berichte in: $OutputPath" -ForegroundColor Green
+
+if ($Auswertung) {
+    $auswertungScript = Join-Path $PSScriptRoot 'New-LizenzAuswertung.ps1'
+    if (Test-Path $auswertungScript) {
+        & $auswertungScript -ReportPath $OutputPath -InactiveDays $InactiveDays -NewAccountDays $NewAccountDays
+    }
+    else { Write-Warning "New-LizenzAuswertung.ps1 nicht gefunden in $PSScriptRoot" }
+}
