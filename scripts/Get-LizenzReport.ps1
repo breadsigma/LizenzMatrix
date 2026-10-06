@@ -31,6 +31,10 @@
 .PARAMETER InactiveDays
     Ab wie vielen Tagen ohne Anmeldung ein Konto als inaktiv gilt. Standard: 90
 
+.PARAMETER NewAccountDays
+    Deaktivierte Konten, die juenger sind als diese Anzahl Tage und sich nie angemeldet haben,
+    gelten als vorbereitete Eintritte (kein Entzug). Standard: 60
+
 .PARAMETER Period
     Zeitraum der Nutzungsberichte (D7, D30, D90, D180). Standard: D90
 
@@ -88,6 +92,7 @@
 param(
     [string]$OutputPath = (Join-Path (Get-Location) ("LizenzReport_{0:yyyy-MM-dd}" -f (Get-Date))),
     [int]$InactiveDays = 90,
+    [int]$NewAccountDays = 60,
     [ValidateSet('D7', 'D30', 'D90', 'D180')]
     [string]$Period = 'D90',
     [switch]$IncludeTeamsPhone,
@@ -639,6 +644,7 @@ $result = foreach ($u in $users) {
 
     # --- Empfehlung -------------------------------------------------------------------------
     $empfehlung = ''
+    $anmeldestatus = if (-not $u.AccountEnabled) { 'Konto deaktiviert' } elseif ($null -ne $daysSinceSignIn) { "Aktiv (Anmeldung <= $InactiveDays Tage)" } else { '' }
     $begruendung = New-Object System.Collections.Generic.List[string]
 
     if ($partNumbers.Count -gt 0) {
@@ -651,15 +657,36 @@ $result = foreach ($u in $users) {
             if ($dupes) { $begruendung.Add("Doppellizenz (in E5 enthalten): $($dupes -join ', ')") }
         }
 
-        if (-not $u.AccountEnabled) {
+        $created = ConvertTo-Date $u.CreatedDateTime
+        $isNewAccount = $created -and $created -ge (Get-Date).AddDays(-$NewAccountDays)
+
+        if (-not $u.AccountEnabled -and $isNewAccount -and $null -eq $lastSignIn) {
+            # Konto vor dem Starttermin angelegt und noch deaktiviert -> kein Entzug
+            $anmeldestatus = 'Vorbereiteter Eintritt'
+            $empfehlung = 'Kein Entzug (vorbereiteter Eintritt)'
+            $begruendung.Add("Deaktiviert, erstellt vor $([int]((Get-Date) - $created).TotalDays) Tagen, nie angemeldet")
+        }
+        elseif (-not $u.AccountEnabled) {
+            $anmeldestatus = 'Konto deaktiviert (Austritt)'
             $empfehlung = 'Lizenz entfernen'
             $begruendung.Add('Konto ist deaktiviert')
         }
-        elseif ($HasSignInData -and $null -eq $lastSignIn -and (ConvertTo-Date $u.CreatedDateTime) -and (ConvertTo-Date $u.CreatedDateTime) -lt $cutoff) {
+        elseif ($HasSignInData -and $null -eq $lastSignIn -and $created -and $created -lt $cutoff) {
+            $anmeldestatus = "Nie angemeldet (Konto > $InactiveDays Tage alt)"
             $empfehlung = 'Lizenz entfernen / pruefen'
             $begruendung.Add('Noch nie angemeldet')
         }
+        elseif ($HasSignInData -and $null -eq $lastSignIn) {
+            $anmeldestatus = 'Neu, noch nie angemeldet'
+            $empfehlung = 'Abwarten (neues Konto)'
+        }
+        elseif ($null -ne $daysSinceSignIn -and $daysSinceSignIn -gt 365) {
+            $anmeldestatus = 'Inaktiv > 365 Tage'
+            $empfehlung = 'Lizenz entfernen'
+            $begruendung.Add("Seit $daysSinceSignIn Tagen nicht angemeldet")
+        }
         elseif ($null -ne $daysSinceSignIn -and $daysSinceSignIn -gt $InactiveDays) {
+            $anmeldestatus = if ($daysSinceSignIn -gt 180) { 'Inaktiv 181-365 Tage' } else { "Inaktiv $($InactiveDays + 1)-180 Tage" }
             $empfehlung = 'Lizenz entfernen / pruefen'
             $begruendung.Add("Seit $daysSinceSignIn Tagen nicht angemeldet")
         }
@@ -714,6 +741,7 @@ $result = foreach ($u in $users) {
         Zuweisungsfehler        = $assignErrors
         Letzte_Anmeldung        = $lastSignIn
         Tage_seit_Anmeldung     = $daysSinceSignIn
+        Anmeldestatus           = $anmeldestatus
         Exchange_Letzte_Nutzung = $exchangeLast
         Teams_Letzte_Nutzung    = $teamsLast
         OneDrive_Letzte_Nutzung = $oneDriveLast
@@ -732,7 +760,8 @@ $result = foreach ($u in $users) {
 # --------------------------------------------------------------------------------------------
 Write-Step 'Exportiere'
 $licensed   = @($result | Where-Object { $_.Lizenzen })
-$candidates = @($licensed | Where-Object { $_.Hat_E5 -and ($_.Empfehlung -ne 'E5 behalten' -or $_.Begruendung -like '*Doppellizenz*') })
+$keine = 'E5 behalten', 'OK', 'Unbestimmt (keine Nutzungsdaten)', 'Kein Entzug (vorbereiteter Eintritt)', 'Abwarten (neues Konto)'
+$candidates = @($licensed | Where-Object { $_.Hat_E5 -and ($keine -notcontains $_.Empfehlung -or $_.Begruendung -like '*Doppellizenz*') })
 
 Export-Report $skuOverview '01_SKU-Uebersicht'
 Export-Report ($result | Sort-Object Empfehlung, Name) '02_Benutzer-Lizenzen'
@@ -753,6 +782,10 @@ if (Get-Module -ListAvailable -Name ImportExcel) {
 # --------------------------------------------------------------------------------------------
 Write-Step 'Zusammenfassung'
 $skuOverview | Sort-Object Zugewiesen -Descending | Format-Table Produkt, Gekauft, Zugewiesen, Frei -AutoSize
+
+Write-Host 'E5-Benutzer nach Anmeldestatus:' -ForegroundColor Yellow
+$licensed | Where-Object Hat_E5 | Group-Object Anmeldestatus | Sort-Object Count -Descending |
+    Format-Table @{ n = 'Anmeldestatus'; e = { $_.Name } }, Count -AutoSize
 
 Write-Host 'E5-Benutzer nach Empfehlung:' -ForegroundColor Yellow
 $licensed | Where-Object Hat_E5 | Group-Object Empfehlung | Sort-Object Count -Descending |
