@@ -8,8 +8,9 @@
  Es wird NICHTS geaendert, solange der Block ganz unten auskommentiert bleibt.
 
  Ausgabe: ein Ordner Lizenzcheck_<Datum> mit
-   Mitglieder.csv      alle Mitglieder mit Status und Massnahme
-   Kandidaten.csv      nur die Konten, bei denen etwas zu tun ist
+   Mitglieder.csv      alle Mitglieder: Kuerzel, UPN, EmployeeType, OU, Erstellt, LastLogin,
+                       LastSignInDays, LastPWSet, AccountExpired ("Never" oder Datum)
+   Kandidaten.csv      nur die Konten, bei denen etwas zu tun ist, gleiche Spalten plus Status und Massnahme
    Zusammenfassung.txt Zahlen pro Status, EmployeeType und OU
 
  Wichtig zum Verstaendnis:
@@ -88,22 +89,17 @@ $Ergebnis = foreach ($m in $Mitglieder) {
 
     # --- eine Zeile pro Benutzer ---------------------------------------------------------------
     [pscustomobject]@{
-        Name              = $u.Name
-        Kuerzel           = $u.SamAccountName
-        UPN               = $u.UserPrincipalName
-        Mail              = $u.mail
-        Aktiviert         = $u.Enabled
-        EmployeeType      = $u.employeeType
-        Abteilung         = $u.department
-        OU                = $OU
-        Erstellt          = $u.whenCreated.ToString('dd.MM.yyyy')
-        LetzterLogin      = if ($u.LastLogonDate) { $u.LastLogonDate.ToString('dd.MM.yyyy') } else { '' }
-        TageSeitLogin     = $TageSeitLogin
-        PasswortGesetzt   = if ($u.PasswordLastSet) { $u.PasswordLastSet.ToString('dd.MM.yyyy') } else { '' }
-        KontoLaeuftAb     = if ($u.AccountExpirationDate) { $u.AccountExpirationDate.ToString('dd.MM.yyyy') } else { '' }
-        Status            = $Status
-        Massnahme         = $Massnahme
-        DN                = $u.DistinguishedName
+        Kuerzel        = $u.SamAccountName
+        UPN            = $u.UserPrincipalName
+        EmployeeType   = $u.employeeType
+        OU             = $OU
+        Erstellt       = $u.whenCreated.ToString('dd.MM.yyyy')
+        LastLogin      = if ($u.LastLogonDate) { $u.LastLogonDate.ToString('dd.MM.yyyy') } else { 'Never' }
+        LastSignInDays = if ($null -ne $TageSeitLogin) { $TageSeitLogin } else { 'Never' }
+        LastPWSet      = if ($u.PasswordLastSet) { $u.PasswordLastSet.ToString('dd.MM.yyyy') } else { 'Never' }
+        AccountExpired = if ($u.AccountExpirationDate) { $u.AccountExpirationDate.ToString('dd.MM.yyyy') } else { 'Never' }
+        Status         = $Status
+        Massnahme      = $Massnahme
     }
 }
 
@@ -112,8 +108,13 @@ $Ergebnis = foreach ($m in $Mitglieder) {
 # =============================================================================================
 $Kandidaten = $Ergebnis | Where-Object { $_.Massnahme -like 'Entziehen*' -or $_.Massnahme -like 'Mit Amt*' }
 
-$Ergebnis   | Sort-Object Status, Name | Export-Csv "$Ausgabe\Mitglieder.csv" -NoTypeInformation -Delimiter ';' -Encoding UTF8
-$Kandidaten | Sort-Object Massnahme, Status, Name | Export-Csv "$Ausgabe\Kandidaten.csv" -NoTypeInformation -Delimiter ';' -Encoding UTF8
+$Spalten = 'Kuerzel', 'UPN', 'EmployeeType', 'OU', 'Erstellt', 'LastLogin', 'LastSignInDays', 'LastPWSet', 'AccountExpired'
+
+# Mitglieder.csv: genau diese Spalten. Kandidaten.csv: dieselben plus Status und Massnahme.
+$Ergebnis   | Sort-Object Kuerzel | Select-Object $Spalten |
+    Export-Csv "$Ausgabe\Mitglieder.csv" -NoTypeInformation -Delimiter ';' -Encoding UTF8
+$Kandidaten | Sort-Object Massnahme, Status, Kuerzel | Select-Object ($Spalten + 'Status', 'Massnahme') |
+    Export-Csv "$Ausgabe\Kandidaten.csv" -NoTypeInformation -Delimiter ';' -Encoding UTF8
 
 $Text = @()
 $Text += "Lizenzcheck $Gruppe - $($Heute.ToString('dd.MM.yyyy HH:mm'))"
